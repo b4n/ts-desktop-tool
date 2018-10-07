@@ -1,0 +1,157 @@
+#!/bin/sh
+#
+#  ts-desktop-tool
+#
+#  Copyright 2018 Colomban Wendling <ban@herbesfolles.org>
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+
+# This is a small hackish tool to help translate .desktop files using
+# Qt's .ts files.
+#
+# This tool can do two things:
+#
+# * Create a C++ source file parseable by lupdate from a .desktop file:
+#     $0 extract
+# * Merge translations from a series of .ts file into a .desktop file
+#     $0 merge TS_FILE...
+#
+# All commands read the template .desktop file from stdin, and write their
+# output to stdout.
+# The input format for .desktop files is the same as the one used by intltool,
+# that is keys to be translated should be prefixed by an underscore (_).
+#
+# LIMITATIONS
+#
+# This tool is fairly hackish in its implementation, and doesn't use robust
+# parsers -- far from it.  It should work in all usual cases, but can likely
+# get fooled by valid yet uncommon input, and will surely be fooled by invalid
+# input.
+
+set -e
+
+# Section in the .ts file.  Has to be a valid C++ class identifier.
+TS_SECTION=DesktopFile
+
+# Gets the first translation value from stdin
+ts_get_first_translation() {
+  sed -ne "
+  /<!--/,/-->/d
+  /<translation [^>]*type=['\"]unfinished['\"]/q
+  /<translation[ \t>]/,/<\/translation>/{
+    h
+    s/\([[:space:]]\)\{2,\}/\1/g
+    s/^[[:space:]]*<[^>]*>//
+    s/<[^<]*$//
+    s/&lt;/</g
+    s/&gt;/>/g
+    s/&apos;/'/g
+    s/&amp;/&/g
+    p
+    x
+  }
+  /<\/translation>/q
+  " | \
+  tr -d '\n'
+}
+
+# Get section $1 content from stdin
+ts_get_section() {
+  sed -ne "
+    /<!--/,/-->/d
+    /<name>$1<\/name>/,/<\/context>/p"
+}
+
+# Get first translation match for source message $1
+ts_get_translation_for() {
+  grep -F "<source>$(echo "$1" | sed -e "
+    s/&/\&amp;/g
+    s/'/\&apos;/g
+    s/\"/\&quot;/g
+    s/>/\&gt;/g
+    s/</\&lt;/g
+  ")</source>" -A256 | \
+  ts_get_first_translation
+}
+
+# Get the Desktop Entry translation for $1
+ts_get_desktop_translation() {
+  ts_get_section "$TS_SECTION" | \
+  ts_get_translation_for "$1"
+}
+
+# Translates desktop file from stdin with translations in $@
+# Translation files should have a _LANG.ts suffix
+desktop_merge_ts() {
+  # this is fairly ugly, but is useful as it's fairly hard to implement
+  # pipefail in a shell that doesn't have it, and POSIX doesn't have it.
+  # So, just check the files are files, which is the most likely cause for
+  # failure anyway -- it's the user's input.
+  for ts in "$@"; do
+    if ! test -f "$ts"; then
+      echo "$ts: not a file">&2
+      return 1
+    fi
+  done
+
+  while read -r line; do
+    if test -z "${line%%_*}"; then
+      echo "${line#*_}"
+      key=${line%%=*}; key=${key#*_}
+      value=${line#*=}; value="$(echo "$value" | sed 's/\\s/ /g')"
+      for ts in "$@"; do
+        localized=$(ts_get_desktop_translation <"$ts" "$value" | sed 's/^ /\\s/') || false
+        [ -n "$localized" ] || continue
+        lang=${ts#*_}; lang=${lang%.*}
+        echo "$key[$lang]=$localized"
+      done
+    else
+      echo "$line"
+    fi
+  done
+}
+
+# Generates a C++ source file to be parsed by lupdate from a desktop file
+# from stdin
+desktop_generate_cxx() {
+  cat <<EOF
+#include <QtCore>
+class $TS_SECTION {
+	Q_OBJECT
+EOF
+  sed -n '
+  /^_[^=]*=/{
+    h
+    # process the value part, escaping it as needed
+    s/^[^=]*=//
+    s/\\s/ /g
+    s/"/\\&/g
+    s/^.*$/tr("&");/
+    x
+    # process the key part, sanitizing it as needed
+    s/=.*$/=/
+    s/[^[:alnum:]_=]/_/g
+    s/^_/	QString /
+    G
+    s/\n//g
+    p
+  }'
+  echo '}'
+}
+
+
+case "$1" in
+  extract) desktop_generate_cxx;;
+  merge) shift; desktop_merge_ts "$@";;
+  *) echo "Unknown action '$1'">&2; exit 1;;
+esac
